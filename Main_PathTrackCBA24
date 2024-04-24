@@ -1,0 +1,561 @@
+%% ===###===###===###===    CBA 2024   ===###===###===###===###
+%%%%  Drone: Parrot Bebop 2 Quadrotor  %%%%
+
+
+% * Task: Performing a Path-Planning to Inpection the health of Plants in a crop 
+% - Controller: underactuated dynamic controller
+% 
+% -> Acessories: - Joystick Xbox 360 
+%                - Optitrack Motive 2.1
+%                - Parrot Bebop2 (the Camera's view is used)
+%
+% Date: 12/04/2024
+% ===###===###===###===###===###===###===###===###===###===###===###===###
+
+%% Script Real Time Version
+clc, clearvars, close all
+
+try
+    fclose(instrfindall);
+catch
+end
+
+% Looking for the root directory
+FolderCurrent = pwd;
+
+% Modify Root Folder if necessary.
+FolderRoot = 'AuRoRA - CBA';
+
+cd(FolderCurrent(1:(strfind(FolderCurrent,FolderRoot)+numel(FolderRoot)-1)))
+addpath(genpath(pwd))
+% =========================================================================
+
+%% - Load Class
+try
+    % Load Classes
+    % - Bebop 2
+    tic
+    B = Bebop;  
+    toc % Show the time used to initialize the class
+
+    B.rConnect; 
+
+    % Joystick
+    J = JoyControl;
+
+    % Create OptiTrack object and initialize
+    OPT = OptiTrack;
+    OPT.Initialize('192.168.0.128','multicast'); % usar esta para PC do
+    % Matlab != do PC do Optitrack
+    % OPT.Initialize(); % PC Optitrack  rodando Matlab Code main Control
+    rb = OPT.RigidBody;               % read optitrack data
+
+    % detect rigid body ID from optitrack
+    idB = getOptID(OPT,B,1);                 % ID do Bebop no OptiTrack // idB = getOptID(OPT,Bebop(1,'B1'),1);     % ID do Bebop no OptiTrack
+    B = getOptData_TimeStamp(rb(idB),B);     % get Bebop data
+
+    CheckIfIsTracked = rb(idB).isTracked;
+
+    disp('UAV Position:')
+    disp(B(1).pPos.X(1:6))
+
+    B.pPos.Xo([1 2 3]) = B.pPos.X([1 2 3]);
+    B.pPos.X_takeOff([1 2 3]) = B.pPos.Xo([1 2 3]);
+    B.pPar.fightState = 'landed';
+
+    disp('############# Load Class Success #############');
+
+catch ME
+    disp(' ');
+    disp('############# Load Class Issues #############');
+    disp(' ');
+    disp(' ');
+    disp(ME);
+
+    clear B;
+    return;
+end
+
+%% ----------------------------> Emergency Button:
+nLandMsg = 3;
+btnEmergencia = 0;
+figure('Position',[10,770,320,220]') %
+ButtonHandle = uicontrol('Style', 'PushButton', ...
+    'String', 'rLand', ...
+    'FontName','Times New Roman', ...
+    'FontSize', 40, ...
+    'Callback', 'emergencyBebop', ...
+    'Position', [10 10 300 200]);
+
+% Beboop
+%% Variable initialization
+B.pPar.Ts = 1/30;
+ts = B.pPar.Ts; % Sample time used as reference during simulation
+
+% Time variables initialization
+T_CONTROL = 1/30;      % ROS: 200 ms de Amostragem | 5 Hz de Frequência
+T_MAX = 2.5*60;        % total experiment time [s]
+flightTime = T_MAX;
+
+% - Criando a Figura que rodará a simulação (Ambiente de Simulação)
+pos_simu = [10 50 650 500];
+[Info,f] = initGraphics(flightTime, pos_simu); %, pos_simu);
+% [Info,f] = initGraphics(flightTime); %, pos_simu);
+% =========================================================================
+% - Mission Description:
+% Trajectory Variables
+% - Statistics
+ta = 0;
+h = [];
+IAH = {}; IBH = {};
+
+% Mission initialization
+% --------------------------
+% >> Camera:
+B.rCamera;
+B.pCam.preview;
+% --------------------------
+
+% - Segurança de vôo:
+ct_B1 = 0; % Count B1 rigid body on Optitrack
+landed = 1;
+stopControl = 1;
+disp('Preloop')
+
+%% ######### >>  Visualization Window << #########
+% >> Path - Planning
+n = 4; % Number of sides
+base = [-2.5 -1.5 -2.5 -1.5 0 .02]; % Vertices da base Takeoff/Landing
+
+% Vertices
+vertices = [base([1 3 5]); base([2 3 5]); base([2 4 5]); base([1 4 5]); ...
+           base([1 3 6]); base([2 3 6]); base([2 4 6]); base([1 4 6])];
+
+f1 = [1:4; 5:8]; % Superior face
+
+% Side faces
+faceLado = [];
+for ii= 1:n
+    faceLado(ii, :) = [ii ii+1 n+ii+1 n+ii];
+    if ii==4
+        faceLado(ii, :) = [ii ii-3 n+1 n+ii];
+    end
+end
+
+faces = [faceLado; f1];
+
+Plat_TL = patch('Faces',faces,'Vertices',vertices,'FaceColor',[52, 152, 219]/255,...
+                    'FaceAlpha',.75,'EdgeColor','k','EdgeAlpha',0.6);
+
+% ------- Canteiros -------
+% -> vertex of beds (canteiros) = [x y z]'
+vert_bed = [-1.5  1.5  1.5  -1.5;
+            -.25 -.25  .25  .25;
+              0    0    0    0];
+             
+[H_beds, heigBed] = creatBed(vert_bed);
+
+% ------- Plants -------
+% --> vertex of plant 1 = [X Y Z]'
+vert_plant = [-1.35  -1.15  -1.15  -1.35;
+               -1.1   -1.1  -.9   -.9;
+               heigBed*ones(1,4)];
+            
+H_plants = createPlants(vert_plant);
+
+% ------- Path/UAV  ------
+n_step = 35;
+path = createPath(n_step); % Function to create path to this simulation:
+
+% plot the last and begining position of path
+EndPoint = plot3(path(end,1), path(end,2), path(end,3),'xr',MarkerSize=7, LineWidth=2);
+SatartPoint = plot3(path(1,1), path(1,2), path(1,3),'*r',MarkerSize=6, LineWidth=1.5);
+
+% plot the moviment of UAV
+UAV = plot3(B.pPos.X(1),B.pPos.X(2),B.pPos.X(3),'-k','LineWidth',1);
+
+% plot the desired initial position of UAV
+UAVd = plot3(path(:,1), path(:,2), path(:,3),'--r','LineWidth',1);
+
+B.mCADplot; % plot the Bebop in Arena of simulation
+pause(1);   % Wait for 1 seconds
+
+%% Mission initialization
+
+disp('Start Take Off Timming....');
+if B.pFlag.Connected
+    if B.pCom.BatteryLevel > 10 % Batery higher 10 %
+        B.rTakeOff; % In the first test => Coment TakeOff !!!!
+        disp('Taking Off End Time....');
+    else
+        B.rEmergency; % instantaneously ends the flight of Parrot drone by shutting down all the motors.
+        disp('Low Battery');
+        disp(['Battery level: ' num2str(B.pCom.BatteryLevel) '%'])
+    end
+end
+% pause(3);   % Wait for 3 seconds
+% =========================================================================
+fprintf('\nStart..............\n\n');
+
+% - Timers:
+t = tic;          % experiment current time
+t_control = tic;  % control loop time
+tp = tic;         % timer para controle do plot
+
+% =========> List of data to store (include others if necessary) <=========
+simDataVars = [B.pPos.Xd'  B.pPos.X'  B.pSC.Ud'  B.pSC.U'  toc(t)];
+% Prealocating memory to store the simulation data
+simData = zeros(ceil(T_MAX/ts),length(simDataVars));
+simDataIdx = 1;
+% =========================================================================
+
+% --- Variables:
+idx = 1;
+Vel_d = .225; % >>> Velocity Desired
+goHome = 0;
+Start_task = 1;
+plant_sick = 0;
+goPath = 0;
+gobackPath = 0;
+
+%% - Inicialização da Simulação
+while toc(t) < 10*flightTime && B.pCom.BatteryLevel > 5
+
+    if toc(t_control) > T_CONTROL
+
+        t_control = tic;   % control time
+        t_atual = toc(t);  % current time
+
+        % ---------------------------------------------------------------------
+        % ------   DECALRATION TASK MISSION POSITION  ----              
+        %==================================
+        % Desired Tracing-path (implementation)
+        % --> Find the index of point of paht more closest of UAV
+        if t_atual < 3
+            B.pPos.Xd(1:3) = [B.pPos.X_takeOff(1:2) 1]';
+        else
+            %[dist_min, idx_min]  = [point more closed, index];
+            [dist_min, idx_min] = min(sqrt((path(:,1) - B.pPos.X(1)).^2 + (path(:,2) - B.pPos.X(2)).^2 + (path(:,3) - B.pPos.X(3)).^2));
+            
+             % --> Start Task (go to begning of the path):
+            if Start_task == 1
+                B.pPos.Xd(1:3) = path(1,:)';
+                if norm(B.pPos.X(1:3) - path(1,:)') < .15
+                    Start_task = 0;
+                    goPath = 1;
+                end
+            end
+
+            if goPath == 1 % +++> UAV Tracking-Path <+++ 
+                B.pPos.Xd(1:3) = path(idx+1,:)';
+
+                if idx < length(path)-1
+                    % vet_vel = path(idx,:) - B.pPos.X(1:3)';
+                    vet_vel = path(idx + 1,:) - path(idx,:);
+                    % B.pPos.Xd(1:3) = path(idx,:);
+                    B.pPos.Xd(6) = atan2(vet_vel(2), vet_vel(1));    % [psi_d];
+
+                    if norm(path(idx,:) - B.pPos.X(1:3)') < 1.75*norm(path(idx+1,:) - path(idx,:)) % 250% of distance
+                        idx = idx+1;
+                        % vet_vel = path(idx,:) - B.pPos.X(1:3)';
+                        vet_vel = path(idx,:) - path(idx-1,:);
+                        % B.pPos.Xd(1:3) = path(idx,:);
+                        B.pPos.Xd(6) = atan2(vet_vel(2), vet_vel(1));    % [psi_d];
+                    end
+                end
+
+                % ---> Desired Speed send to UAV:
+                if (idx > n_step && idx < 2*n_step) || (idx > 3*n_step &&  idx < 4*n_step)
+                    % ----> Speed in the curves:
+                    disp('Faz a curva moço !')
+                    B.pPos.Xd(7:9) = 2*Vel_d*(vet_vel / (norm(vet_vel) + eps))';
+                else % ----> Speed in the lines:
+                    B.pPos.Xd(7:9) = Vel_d*(vet_vel / (norm(vet_vel) + eps))';
+                    disp('reta')
+                end
+
+                % ########> Move to closed the plant to take photo <########
+                if t_atual > 15 && t_atual < 16 && plant_sick == 0
+                    last_point = path(idx,:)';
+                    B.pPos.Xd(7:9) = [0 0 0]';
+                    plant_sick = 1; %(Planta doente)
+                    goPath = 0;     % go out of path
+                end
+                % ##########################################################
+
+                % if norm(path(end,:) - B.pPos.X(1:3)') < 0.15 && goHome == 0
+                if norm(path(end,:) - B.pPos.X(1:3)') < 1*norm(path(idx+1,:) - path(idx,:)) && goHome == 0                 
+                    B.pPos.Xd(7:9) = [0 0 0]';      % > STOP!
+                    B.pPos.Xd(1:3) = path(end,:)';  % > Wait in the end of path
+                    goHome = 1;
+                    t_home = tic;
+                end
+
+                if goHome == 1
+                    if  toc(t_home) > 3 % wait 5 sec to return to Landing
+                        B.pPos.Xd(1:3) = (B.pPos.X_takeOff([1 2 3]) + [-.15 0 1])';
+                        if norm(B.pPos.X(1:3) - (B.pPos.X_takeOff([1 2 3]) + [-.15 0 1])') < 0.1
+                            B.rLand;
+                        end
+                    end
+                end                
+            end
+
+            % ============>  STRATEGY TO TAKE PHOTO  <===========
+            % 1> Go to closed of the plant to take photo:
+            if plant_sick == 1 && gobackPath == 0
+                B.pPos.Xd(1:3) = last_point + [0 0 -.5]'; % Closed to take photo
+                if abs(B.pPos.X(3) - (last_point(3) -.5)) < .05
+                    gobackPath = 1;
+                    disp('---> Tira a foto rapaz !!!')
+                end
+            end
+            % 2> Return to last point of path:
+            if gobackPath == 1
+                B.pPos.Xd(1:3) = last_point;
+                if abs(B.pPos.X(3) - last_point(3)) < .03
+                    goPath = 1;
+                    gobackPath = 0;
+                    plant_sick = 0;
+                end
+            end   
+            % ==================================================
+        end
+
+        % ---------------------------------------------------------------------
+        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        %                     POSIÇÃO REAL DO UAV                         %
+        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        % Acquire sensors data
+        % B.rGetSensorData; % -> Use this command to simulation!
+        % -----------------------------------------------------------------
+        % Get optitrack data
+        rb = OPT.RigidBody;             % read optitrack
+
+        if rb(idB).isTracked
+            % - Bebop:
+            B = getOptData_TimeStamp(rb(idB),B);
+            % disp(B.pPos.X(1:3))
+        else
+            disp('----------------------------------------------------')
+            disp('Aborting mission: Drone is not being tracked!!!!!!!!')
+            B.rLand
+        end
+
+        % disp([B.pPos.Xd([1:3 6])' B.pPos.X([1:3 6])'])
+
+        % - State error update
+        B.pPos.Xtil = B.pPos.Xd - B.pPos.X;
+
+        % ---------------------------------------------------------------------
+        % - Controllers:
+        % Beboop
+        %  stopControl = 0;
+        if stopControl % Só manda se não tiver pedido por pelo menos um Land
+            B.cInverseDynamicController_BDPfly; %(gains); %cInverseDynamicController_Compensador;
+            % B.cInverseDynamicController_Compensador;
+        else
+            B.pSC.Ud = [0 0 0 0]';
+        end
+        
+        % ---------------------------------------------------------------------
+        % - Storing experimentation data
+        % Variable to feed plotResults function
+        simDataVars = [B.pPos.Xd' B.pPos.X' B.pSC.Ud' B.pSC.U' t_atual];
+
+        simData(simDataIdx,:) = simDataVars;
+        simDataIdx = simDataIdx + 1;
+
+        % ==> Data index
+        %  1 -- 12       13 -- 24      25 -- 28     29 -- 32     33
+        % B.pPos.Xd'    B.pPos.X'     B.pSC.Ud'    B.pSC.U'    toc(t)
+        % ---------------------------------------------------------------------
+
+        % - Sending control signals
+        % Beboop
+        % B = J.mControl(B);   % Joystick Command Priority
+
+        B.rSendControlSignals;
+
+        % ########     EMERGENCY PROTOCOLS    #########
+        % ---------------------------------------------------------------------
+        % If push Emergency or ROS Emergency Stop On or Not Rigid Body tracked Stop loop
+        drawnow
+        if btnEmergencia ~= 0 || B.pFlag.EmergencyStop ~= 0
+            fprintf('\n')
+            disp('Bebop Landing through Emergency Command ');
+
+            % Send 3 times Commands 1 second delay to Drone Land
+            for i=1:nLandMsg
+                fprintf('\n')
+                disp("End Land Command");
+                %B.rCmdStop;
+                %B.pSC.Ud = [0 0 0 0]';
+
+                B.rLand;
+                if stopControl
+                    stopControl = 0;
+                end
+            end
+            break;
+        end
+
+        % ===>  ANTI-PAREDE
+        lim_parede = [3;2.50; 2.25];
+        if sum(abs(B.pPos.X(1:3)) > lim_parede) ~= 0
+            emergencyBebop;
+            fprintf('\n')
+            disp('OLHA A PAREDE, MEU TRUTA!')
+
+        else
+            btnEmergencia = 0;
+        end
+
+        % Land if body is not being tracked by 30 iteractions
+        if rb(idB).isTracked
+            ct_B1 = 0;
+        else
+            B.pSC.Ud = zeros(4,1);
+            ct_B1 = ct_A1 + 1;
+            fprintf('\n')
+            disp('PERDEU!!!!PERDEU!!!')
+        end
+
+        if ct_B1 >= 30
+            emergencyBebop;
+        end
+
+        % - Title
+        time = t_atual;  % Current Time
+        Info.String = ['\textbf{Time}: ' num2str(time,'%05.2f') ' | ' num2str(T_MAX,'%05.2f') ' [s]~~~($1\times$)'];
+
+        % - Plot the data in real time
+        if toc(tp) > 5*ts
+            tp = tic;
+            B.mCADplot;
+            UAV.XData = [UAV.XData B.pPos.X(1)];
+            UAV.YData = [UAV.YData B.pPos.X(2)];
+            UAV.ZData = [UAV.ZData B.pPos.X(3)];
+        %     UAVd.XData = [UAVd.XData B.pPos.Xd(1)];
+        %     UAVd.YData = [UAVd.YData B.pPos.Xd(2)];
+        %     UAVd.ZData = [UAVd.ZData B.pPos.Xd(3)];
+            drawnow;
+        end
+    end
+end
+
+%% - Finishing the experiments
+% - Send 3 times Commands 1 second delay to Drone Land
+fprintf('\n')
+for i=1:nLandMsg
+    disp("End Land Command");
+    disp(['Battery Level - B: ' num2str(B.pCom.BatteryLevel)])
+    % B.rCmdStop;
+    B.rLand;
+end
+
+% Close Robot Connection and Clear Variable
+% clear B;
+disp("Bebop 2 disconnected succesfully...");
+
+% Removing data not filled
+simData(simDataIdx:end,:) = [];
+
+% =========================================================================
+
+%% - Plotting results  ====================================================
+plot_results = 0;
+if plot_results
+
+    % -------------- Error of Position
+    fig_erro = figure('Name','Error of Position','NumberTitle','off');
+    figure(fig_erro);
+    subplot(4,1,1)
+    plot(simData(:,end),simData(:,1) - simData(:,13));
+    legend('$\tilde{x}$','interpreter','latex')
+    grid
+
+    subplot(4,1,2)
+    plot(simData(:,end),simData(:,2) - simData(:,14));
+    legend('$\tilde{y}$','interpreter','latex')
+    grid
+
+    subplot(4,1,3)
+    plot(simData(:,end),simData(:,3) - simData(:,15));
+    legend('$\tilde{z}$','interpreter','latex')
+    grid
+
+    subplot(4,1,4)
+    plot(simData(:,end),simData(:,6) - simData(:,18));
+    legend('$\tilde{\psi}$','interpreter','latex')
+    grid
+
+    % -------------- Position (Xd and X)
+    fig_xd_x = figure('Name','Desired and Currently Position','NumberTitle','off');
+    figure(fig_xd_x);
+    subplot(3,1,1)
+    plot(simData(:,end),simData(:,1),'--');
+    hold on
+    plot(simData(:,end),simData(:,13));
+    legend({'$x_{d}$','$x$'},'interpreter','latex')
+    grid
+
+    subplot(3,1,2)
+    plot(simData(:,end),simData(:,2),'--');
+    hold on
+    plot(simData(:,end),simData(:,14));
+    legend({'$y_{d}$','$y$'},'interpreter','latex')
+    grid
+
+    subplot(3,1,3)
+    plot(simData(:,end),simData(:,3),'--');
+    hold on
+    plot(simData(:,end),simData(:,15));
+    legend({'$z_d$','$z$'},'interpreter','latex')
+    grid
+
+    % --------------   Orientation
+    fig_orient = figure('Name','Orientation','NumberTitle','off');
+    figure(fig_orient);
+    subplot(311),plot(simData(:,end),simData(:,[4 16])*180/pi)
+    legend('$$\phi_{d}$$','$$\phi$$','interpreter','latex')
+    grid
+    subplot(312),plot(simData(:,end),simData(:,[5 17])*180/pi)
+    legend('$$\theta_{d}$$','$$\theta$$','interpreter','latex')
+    grid
+    subplot(313),plot(simData(:,end),simData(:,[6 18])*180/pi)
+    legend('$$\psi_{d}$$','$$\psi$$','interpreter','latex')
+    grid
+
+    % --------------  Control Signals
+    fig_sgncontrol = figure('Name','Control Signals','NumberTitle','off');
+    figure(fig_sgncontrol);
+    subplot(4,1,1)
+    plot(simData(:,end),simData(:,25),'--');
+    hold on
+    plot(simData(:,end),simData(:,29));
+    legend({'$u_{d_{x}}$','$u_{x}$'},'interpreter','latex','FontSize',16)
+    grid
+
+    subplot(4,1,2)
+    plot(simData(:,end),simData(:,26),'--');
+    hold on
+    plot(simData(:,end),simData(:,30));
+    legend({'$u_{d_{y}}$','$u_{y}$'},'interpreter','latex','FontSize',16)
+    grid
+
+    subplot(4,1,3)
+    plot(simData(:,end),simData(:,27),'--');
+    hold on
+    plot(simData(:,end),simData(:,31));
+    legend({'$u_{d_{z}}$','$u_{z}$'},'interpreter','latex','FontSize',16)
+    grid
+
+    subplot(4,1,4)
+    plot(simData(:,end),simData(:,28),'--');
+    hold on
+    plot(simData(:,end),simData(:,32));
+    legend({'$u_{d_{\psi}}$','$u_{\psi}$'},'interpreter','latex','FontSize',16)
+    grid
+
+end
